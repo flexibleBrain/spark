@@ -17,10 +17,7 @@
 
 package org.apache.spark.deploy.yarn
 
-import java.util.{List => JList}
-
 import scala.collection.JavaConverters._
-import scala.util.Try
 
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.yarn.api.records._
@@ -33,7 +30,6 @@ import org.apache.spark.{SecurityManager, SparkConf}
 import org.apache.spark.deploy.yarn.config._
 import org.apache.spark.internal.Logging
 import org.apache.spark.rpc.RpcEndpointRef
-import org.apache.spark.util.Utils
 
 /**
  * Handles registering and unregistering the application with the YARN ResourceManager.
@@ -47,35 +43,47 @@ private[spark] class YarnRMClient extends Logging {
   /**
    * Registers the application master with the RM.
    *
+   * @param driverHost Host name where driver is running.
+   * @param driverPort Port where driver is listening.
    * @param conf The Yarn configuration.
    * @param sparkConf The Spark configuration.
    * @param uiAddress Address of the SparkUI.
    * @param uiHistoryAddress Address of the application on the History Server.
-   * @param securityMgr The security manager.
-   * @param localResources Map with information about files distributed via YARN's cache.
    */
   def register(
-      driverUrl: String,
-      driverRef: RpcEndpointRef,
+      driverHost: String,
+      driverPort: Int,
       conf: YarnConfiguration,
       sparkConf: SparkConf,
-      uiAddress: String,
-      uiHistoryAddress: String,
-      securityMgr: SecurityManager,
-      localResources: Map[String, LocalResource]
-    ): YarnAllocator = {
+      uiAddress: Option[String],
+      uiHistoryAddress: String): Unit = {
     amClient = AMRMClient.createAMRMClient()
     amClient.init(conf)
     amClient.start()
     this.uiHistoryAddress = uiHistoryAddress
 
+    val trackingUrl = uiAddress.getOrElse {
+      if (sparkConf.get(ALLOW_HISTORY_SERVER_TRACKING_URL)) uiHistoryAddress else ""
+    }
+
     logInfo("Registering the ApplicationMaster")
     synchronized {
-      amClient.registerApplicationMaster(Utils.localHostName(), 0, uiAddress)
+      amClient.registerApplicationMaster(driverHost, driverPort, trackingUrl)
       registered = true
     }
-    new YarnAllocator(driverUrl, driverRef, conf, sparkConf, amClient, getAttemptId(), securityMgr,
-      localResources)
+  }
+
+  def createAllocator(
+      conf: YarnConfiguration,
+      sparkConf: SparkConf,
+      appAttemptId: ApplicationAttemptId,
+      driverUrl: String,
+      driverRef: RpcEndpointRef,
+      securityMgr: SecurityManager,
+      localResources: Map[String, LocalResource]): YarnAllocator = {
+    require(registered, "Must register AM before creating allocator.")
+    new YarnAllocator(driverUrl, driverRef, conf, sparkConf, amClient, appAttemptId, securityMgr,
+      localResources, SparkRackResolver.get(conf))
   }
 
   /**
@@ -88,34 +96,28 @@ private[spark] class YarnRMClient extends Logging {
     if (registered) {
       amClient.unregisterApplicationMaster(status, diagnostics, uiHistoryAddress)
     }
-  }
-
-  /** Returns the attempt ID. */
-  def getAttemptId(): ApplicationAttemptId = {
-    YarnSparkHadoopUtil.get.getContainerId.getApplicationAttemptId()
+    if (amClient != null) {
+      amClient.stop()
+    }
   }
 
   /** Returns the configuration for the AmIpFilter to add to the Spark UI. */
   def getAmIpFilterParams(conf: YarnConfiguration, proxyBase: String): Map[String, String] = {
     // Figure out which scheme Yarn is using. Note the method seems to have been added after 2.2,
     // so not all stable releases have it.
-    val prefix = Try(classOf[WebAppUtils].getMethod("getHttpSchemePrefix", classOf[Configuration])
-      .invoke(null, conf).asInstanceOf[String]).getOrElse("http://")
-
-    // If running a new enough Yarn, use the HA-aware API for retrieving the RM addresses.
-    try {
-      val method = classOf[WebAppUtils].getMethod("getProxyHostsAndPortsForAmFilter",
-        classOf[Configuration])
-      val proxies = method.invoke(null, conf).asInstanceOf[JList[String]]
-      val hosts = proxies.asScala.map { proxy => proxy.split(":")(0) }
-      val uriBases = proxies.asScala.map { proxy => prefix + proxy + proxyBase }
+    val prefix = WebAppUtils.getHttpSchemePrefix(conf)
+    val proxies = WebAppUtils.getProxyHostsAndPortsForAmFilter(conf)
+    val hosts = proxies.asScala.map(_.split(":").head)
+    val uriBases = proxies.asScala.map { proxy => prefix + proxy + proxyBase }
+    val params =
       Map("PROXY_HOSTS" -> hosts.mkString(","), "PROXY_URI_BASES" -> uriBases.mkString(","))
-    } catch {
-      case e: NoSuchMethodException =>
-        val proxy = WebAppUtils.getProxyHostAndPort(conf)
-        val parts = proxy.split(":")
-        val uriBase = prefix + proxy + proxyBase
-        Map("PROXY_HOST" -> parts(0), "PROXY_URI_BASE" -> uriBase)
+
+    // Handles RM HA urls
+    val rmIds = conf.getStringCollection(YarnConfiguration.RM_HA_IDS).asScala
+    if (rmIds != null && rmIds.nonEmpty) {
+      params + ("RM_HA_URLS" -> rmIds.map(getUrlByRmId(conf, _)).mkString(","))
+    } else {
+      params
     }
   }
 
@@ -124,12 +126,27 @@ private[spark] class YarnRMClient extends Logging {
     val sparkMaxAttempts = sparkConf.get(MAX_APP_ATTEMPTS).map(_.toInt)
     val yarnMaxAttempts = yarnConf.getInt(
       YarnConfiguration.RM_AM_MAX_ATTEMPTS, YarnConfiguration.DEFAULT_RM_AM_MAX_ATTEMPTS)
-    val retval: Int = sparkMaxAttempts match {
+    sparkMaxAttempts match {
       case Some(x) => if (x <= yarnMaxAttempts) x else yarnMaxAttempts
       case None => yarnMaxAttempts
     }
-
-    retval
   }
 
+  private def getUrlByRmId(conf: Configuration, rmId: String): String = {
+    val addressPropertyPrefix = if (YarnConfiguration.useHttps(conf)) {
+      YarnConfiguration.RM_WEBAPP_HTTPS_ADDRESS
+    } else {
+      YarnConfiguration.RM_WEBAPP_ADDRESS
+    }
+
+    val addressWithRmId = if (rmId == null || rmId.isEmpty) {
+      addressPropertyPrefix
+    } else if (rmId.startsWith(".")) {
+      throw new IllegalStateException(s"rmId $rmId should not already have '.' prepended.")
+    } else {
+      s"$addressPropertyPrefix.$rmId"
+    }
+
+    conf.get(addressWithRmId)
+  }
 }

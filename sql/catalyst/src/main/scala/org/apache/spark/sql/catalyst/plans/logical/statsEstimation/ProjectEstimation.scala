@@ -25,17 +25,13 @@ object ProjectEstimation {
 
   def estimate(project: Project): Option[Statistics] = {
     if (rowCountsExist(project.child)) {
-      val childStats = project.child.statistics
-      val inputAttrStats = childStats.attributeStats
-      // Match alias with its child's column stat
-      val aliasStats = project.expressions.collect {
-        case alias @ Alias(attr: Attribute, _) if inputAttrStats.contains(attr) =>
-          alias.toAttribute -> inputAttrStats(attr)
-      }
+      val childStats = project.child.stats
+      val aliasStats = EstimationUtils.getAliasStats(project.expressions, childStats.attributeStats)
+
       val outputAttrStats =
-        getOutputMap(AttributeMap(inputAttrStats.toSeq ++ aliasStats), project.output)
+        getOutputMap(AttributeMap(childStats.attributeStats.toSeq ++ aliasStats), project.output)
       Some(childStats.copy(
-        sizeInBytes = childStats.rowCount.get * getRowSize(project.output, outputAttrStats),
+        sizeInBytes = getOutputSize(project.output, childStats.rowCount.get, outputAttrStats),
         attributeStats = outputAttrStats))
     } else {
       None

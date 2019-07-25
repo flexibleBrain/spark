@@ -22,7 +22,7 @@ import org.apache.hadoop.fs.Path
 import org.apache.spark.annotation.Since
 import org.apache.spark.ml._
 import org.apache.spark.ml.attribute.{AttributeGroup, _}
-import org.apache.spark.ml.linalg.{Vector, VectorUDT}
+import org.apache.spark.ml.linalg._
 import org.apache.spark.ml.param._
 import org.apache.spark.ml.param.shared._
 import org.apache.spark.ml.util._
@@ -143,13 +143,13 @@ private[feature] trait ChiSqSelectorParams extends Params
  * `fdr`, `fwe`.
  *  - `numTopFeatures` chooses a fixed number of top features according to a chi-squared test.
  *  - `percentile` is similar but chooses a fraction of all features instead of a fixed number.
- *  - `fpr` chooses all features whose p-value is below a threshold, thus controlling the false
+ *  - `fpr` chooses all features whose p-value are below a threshold, thus controlling the false
  *    positive rate of selection.
  *  - `fdr` uses the [Benjamini-Hochberg procedure]
  *    (https://en.wikipedia.org/wiki/False_discovery_rate#Benjamini.E2.80.93Hochberg_procedure)
  *    to choose all features whose false discovery rate is below a threshold.
- *  - `fwe` chooses all features whose p-values is below a threshold,
- *    thus controlling the family-wise error rate of selection.
+ *  - `fwe` chooses all features whose p-values are below a threshold. The threshold is scaled by
+ *    1/numFeatures, thus controlling the family-wise error rate of selection.
  * By default, the selection method is `numTopFeatures`, with the default number of top features
  * set to 50.
  */
@@ -264,14 +264,25 @@ final class ChiSqSelectorModel private[ml] (
 
   @Since("2.0.0")
   override def transform(dataset: Dataset[_]): DataFrame = {
-    val transformedSchema = transformSchema(dataset.schema, logging = true)
-    val newField = transformedSchema.last
+    val outputSchema = transformSchema(dataset.schema, logging = true)
 
-    // TODO: Make the transformer natively in ml framework to avoid extra conversion.
-    val transformer: Vector => Vector = v => chiSqSelector.transform(OldVectors.fromML(v)).asML
+    val newSize = selectedFeatures.length
+    val func = { vector: Vector =>
+      vector match {
+        case SparseVector(_, indices, values) =>
+          val (newIndices, newValues) = chiSqSelector.compressSparse(indices, values)
+          Vectors.sparse(newSize, newIndices, newValues)
+        case DenseVector(values) =>
+          Vectors.dense(chiSqSelector.compressDense(values))
+        case other =>
+          throw new UnsupportedOperationException(
+            s"Only sparse and dense vectors are supported but got ${other.getClass}.")
+      }
+    }
 
-    val selector = udf(transformer)
-    dataset.withColumn($(outputCol), selector(col($(featuresCol))), newField.metadata)
+    val transformer = udf(func)
+    dataset.withColumn($(outputCol), transformer(col($(featuresCol))),
+      outputSchema($(outputCol)).metadata)
   }
 
   @Since("1.6.0")
@@ -334,7 +345,7 @@ object ChiSqSelectorModel extends MLReadable[ChiSqSelectorModel] {
       val selectedFeatures = data.getAs[Seq[Int]](0).toArray
       val oldModel = new feature.ChiSqSelectorModel(selectedFeatures)
       val model = new ChiSqSelectorModel(metadata.uid, oldModel)
-      DefaultParamsReader.getAndSetParams(model, metadata)
+      metadata.getAndSetParams(model)
       model
     }
   }

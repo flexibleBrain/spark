@@ -17,9 +17,9 @@
 
 package org.apache.spark.sql.catalyst.catalog
 
-import org.apache.spark.sql.catalyst.analysis.{FunctionAlreadyExistsException, NoSuchDatabaseException, NoSuchFunctionException, NoSuchTableException}
+import org.apache.spark.sql.catalyst.analysis.{FunctionAlreadyExistsException, NoSuchDatabaseException, NoSuchFunctionException, NoSuchPartitionException, NoSuchTableException}
 import org.apache.spark.sql.catalyst.expressions.Expression
-
+import org.apache.spark.sql.types.StructType
 
 /**
  * Interface for the system catalog (of functions, partitions, tables, and databases).
@@ -30,8 +30,12 @@ import org.apache.spark.sql.catalyst.expressions.Expression
  *
  * Implementations should throw [[NoSuchDatabaseException]] when databases don't exist.
  */
-abstract class ExternalCatalog {
+trait ExternalCatalog {
   import CatalogTypes.TablePartitionSpec
+
+  // --------------------------------------------------------------------------
+  // Utils
+  // --------------------------------------------------------------------------
 
   protected def requireDbExists(db: String): Unit = {
     if (!databaseExists(db)) {
@@ -90,7 +94,11 @@ abstract class ExternalCatalog {
 
   def createTable(tableDefinition: CatalogTable, ignoreIfExists: Boolean): Unit
 
-  def dropTable(db: String, table: String, ignoreIfNotExists: Boolean, purge: Boolean): Unit
+  def dropTable(
+      db: String,
+      table: String,
+      ignoreIfNotExists: Boolean,
+      purge: Boolean): Unit
 
   def renameTable(db: String, oldName: String, newName: String): Unit
 
@@ -104,9 +112,23 @@ abstract class ExternalCatalog {
    */
   def alterTable(tableDefinition: CatalogTable): Unit
 
+  /**
+   * Alter the data schema of a table identified by the provided database and table name. The new
+   * data schema should not have conflict column names with the existing partition columns, and
+   * should still contain all the existing data columns.
+   *
+   * @param db Database that table to alter schema for exists in
+   * @param table Name of table to alter schema for
+   * @param newDataSchema Updated data schema to be used for the table.
+   */
+  def alterTableDataSchema(db: String, table: String, newDataSchema: StructType): Unit
+
+  /** Alter the statistics of a table. If `stats` is None, then remove all existing statistics. */
+  def alterTableStats(db: String, table: String, stats: Option[CatalogStatistics]): Unit
+
   def getTable(db: String, table: String): CatalogTable
 
-  def getTableOption(db: String, table: String): Option[CatalogTable]
+  def getTablesByName(db: String, tables: Seq[String]): Seq[CatalogTable]
 
   def tableExists(db: String, table: String): Boolean
 
@@ -125,7 +147,6 @@ abstract class ExternalCatalog {
       table: String,
       loadPath: String,
       isOverwrite: Boolean,
-      holdDDLTime: Boolean,
       isSrcLocal: Boolean): Unit
 
   /**
@@ -140,7 +161,6 @@ abstract class ExternalCatalog {
       loadPath: String,
       partition: TablePartitionSpec,
       isOverwrite: Boolean,
-      holdDDLTime: Boolean,
       inheritTableSpecs: Boolean,
       isSrcLocal: Boolean): Unit
 
@@ -150,8 +170,7 @@ abstract class ExternalCatalog {
       loadPath: String,
       partition: TablePartitionSpec,
       replace: Boolean,
-      numDP: Int,
-      holdDDLTime: Boolean): Unit
+      numDP: Int): Unit
 
   // --------------------------------------------------------------------------
   // Partitions
@@ -247,11 +266,13 @@ abstract class ExternalCatalog {
    * @param db database name
    * @param table table name
    * @param predicates partition-pruning predicates
+   * @param defaultTimeZoneId default timezone id to parse partition values of TimestampType
    */
   def listPartitionsByFilter(
       db: String,
       table: String,
-      predicates: Seq[Expression]): Seq[CatalogTablePartition]
+      predicates: Seq[Expression],
+      defaultTimeZoneId: String): Seq[CatalogTablePartition]
 
   // --------------------------------------------------------------------------
   // Functions
@@ -261,6 +282,8 @@ abstract class ExternalCatalog {
 
   def dropFunction(db: String, funcName: String): Unit
 
+  def alterFunction(db: String, funcDefinition: CatalogFunction): Unit
+
   def renameFunction(db: String, oldName: String, newName: String): Unit
 
   def getFunction(db: String, funcName: String): CatalogFunction
@@ -268,5 +291,4 @@ abstract class ExternalCatalog {
   def functionExists(db: String, funcName: String): Boolean
 
   def listFunctions(db: String, pattern: String): Seq[String]
-
 }

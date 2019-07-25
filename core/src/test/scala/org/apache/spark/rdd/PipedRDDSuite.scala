@@ -19,10 +19,9 @@ package org.apache.spark.rdd
 
 import java.io.File
 
+import scala.collection.JavaConverters._
 import scala.collection.Map
 import scala.io.Codec
-import scala.sys.process._
-import scala.util.Try
 
 import org.apache.hadoop.fs.Path
 import org.apache.hadoop.io.{LongWritable, Text}
@@ -39,7 +38,7 @@ class PipedRDDSuite extends SparkFunSuite with SharedSparkContext {
   }
 
   test("basic pipe") {
-    assume(testCommandAvailable("cat"))
+    assume(TestUtils.testCommandAvailable("cat"))
     val nums = sc.makeRDD(Array(1, 2, 3, 4), 2)
 
     val piped = nums.pipe(Seq("cat"))
@@ -53,7 +52,7 @@ class PipedRDDSuite extends SparkFunSuite with SharedSparkContext {
   }
 
   test("basic pipe with tokenization") {
-    assume(testCommandAvailable("wc"))
+    assume(TestUtils.testCommandAvailable("wc"))
     val nums = sc.makeRDD(Array(1, 2, 3, 4), 2)
 
     // verify that both RDD.pipe(command: String) and RDD.pipe(command: String, env) work good
@@ -66,7 +65,7 @@ class PipedRDDSuite extends SparkFunSuite with SharedSparkContext {
   }
 
   test("failure in iterating over pipe input") {
-    assume(testCommandAvailable("cat"))
+    assume(TestUtils.testCommandAvailable("cat"))
     val nums =
       sc.makeRDD(Array(1, 2, 3, 4), 2)
         .mapPartitionsWithIndex((index, iterator) => {
@@ -85,8 +84,31 @@ class PipedRDDSuite extends SparkFunSuite with SharedSparkContext {
     }
   }
 
+  test("stdin writer thread should be exited when task is finished") {
+    assume(TestUtils.testCommandAvailable("cat"))
+    val nums = sc.makeRDD(Array(1, 2, 3, 4), 1).map { x =>
+      val obj = new Object()
+      obj.synchronized {
+        obj.wait() // make the thread waits here.
+      }
+      x
+    }
+
+    val piped = nums.pipe(Seq("cat"))
+
+    val result = piped.mapPartitions(_ => Array.emptyIntArray.iterator)
+
+    assert(result.collect().length === 0)
+
+    // collect stderr writer threads
+    val stderrWriterThread = Thread.getAllStackTraces.keySet().asScala
+      .find { _.getName.startsWith(PipedRDD.STDIN_WRITER_THREAD_PREFIX) }
+
+    assert(stderrWriterThread.isEmpty)
+  }
+
   test("advanced pipe") {
-    assume(testCommandAvailable("cat"))
+    assume(TestUtils.testCommandAvailable("cat"))
     val nums = sc.makeRDD(Array(1, 2, 3, 4), 2)
     val bl = sc.broadcast(List("0"))
 
@@ -147,7 +169,7 @@ class PipedRDDSuite extends SparkFunSuite with SharedSparkContext {
   }
 
   test("pipe with env variable") {
-    assume(testCommandAvailable(envCommand))
+    assume(TestUtils.testCommandAvailable(envCommand))
     val nums = sc.makeRDD(Array(1, 2, 3, 4), 2)
     val piped = nums.pipe(s"$envCommand MY_TEST_ENV", Map("MY_TEST_ENV" -> "LALALA"))
     val c = piped.collect()
@@ -159,7 +181,7 @@ class PipedRDDSuite extends SparkFunSuite with SharedSparkContext {
   }
 
   test("pipe with process which cannot be launched due to bad command") {
-    assume(!testCommandAvailable("some_nonexistent_command"))
+    assume(!TestUtils.testCommandAvailable("some_nonexistent_command"))
     val nums = sc.makeRDD(Array(1, 2, 3, 4), 2)
     val command = Seq("some_nonexistent_command")
     val piped = nums.pipe(command)
@@ -170,7 +192,7 @@ class PipedRDDSuite extends SparkFunSuite with SharedSparkContext {
   }
 
   test("pipe with process which is launched but fails with non-zero exit status") {
-    assume(testCommandAvailable("cat"))
+    assume(TestUtils.testCommandAvailable("cat"))
     val nums = sc.makeRDD(Array(1, 2, 3, 4), 2)
     val command = Seq("cat", "nonexistent_file")
     val piped = nums.pipe(command)
@@ -181,7 +203,7 @@ class PipedRDDSuite extends SparkFunSuite with SharedSparkContext {
   }
 
   test("basic pipe with separate working directory") {
-    assume(testCommandAvailable("cat"))
+    assume(TestUtils.testCommandAvailable("cat"))
     val nums = sc.makeRDD(Array(1, 2, 3, 4), 2)
     val piped = nums.pipe(Seq("cat"), separateWorkingDir = true)
     val c = piped.collect()
@@ -208,13 +230,8 @@ class PipedRDDSuite extends SparkFunSuite with SharedSparkContext {
     testExportInputFile("mapreduce_map_input_file")
   }
 
-  def testCommandAvailable(command: String): Boolean = {
-    val attempt = Try(Process(command).run(ProcessLogger(_ => ())).exitValue())
-    attempt.isSuccess && attempt.get == 0
-  }
-
   def testExportInputFile(varName: String) {
-    assume(testCommandAvailable(envCommand))
+    assume(TestUtils.testCommandAvailable(envCommand))
     val nums = new HadoopRDD(sc, new JobConf(), classOf[TextInputFormat], classOf[LongWritable],
       classOf[Text], 2) {
       override def getPartitions: Array[Partition] = Array(generateFakeHadoopPartition())

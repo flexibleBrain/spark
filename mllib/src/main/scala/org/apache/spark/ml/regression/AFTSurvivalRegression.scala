@@ -32,11 +32,12 @@ import org.apache.spark.ml.linalg.{BLAS, Vector, Vectors, VectorUDT}
 import org.apache.spark.ml.param._
 import org.apache.spark.ml.param.shared._
 import org.apache.spark.ml.util._
+import org.apache.spark.ml.util.Instrumentation.instrumented
 import org.apache.spark.mllib.linalg.VectorImplicits._
 import org.apache.spark.mllib.stat.MultivariateOnlineSummarizer
 import org.apache.spark.mllib.util.MLUtils
 import org.apache.spark.rdd.RDD
-import org.apache.spark.sql.{DataFrame, Dataset, Row}
+import org.apache.spark.sql.{Column, DataFrame, Dataset, Row}
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types.{DoubleType, StructType}
 import org.apache.spark.storage.StorageLevel
@@ -106,13 +107,15 @@ private[regression] trait AFTSurvivalRegressionParams extends Params
       fitting: Boolean): StructType = {
     SchemaUtils.checkColumnType(schema, $(featuresCol), new VectorUDT)
     if (fitting) {
-      SchemaUtils.checkColumnType(schema, $(censorCol), DoubleType)
+      SchemaUtils.checkNumericType(schema, $(censorCol))
       SchemaUtils.checkNumericType(schema, $(labelCol))
     }
-    if (hasQuantilesCol) {
+
+    val schemaWithQuantilesCol = if (hasQuantilesCol) {
       SchemaUtils.appendColumn(schema, $(quantilesCol), new VectorUDT)
-    }
-    SchemaUtils.appendColumn(schema, $(predictionCol), DoubleType)
+    } else schema
+
+    SchemaUtils.appendColumn(schemaWithQuantilesCol, $(predictionCol), DoubleType)
   }
 }
 
@@ -200,18 +203,18 @@ class AFTSurvivalRegression @Since("1.6.0") (@Since("1.6.0") override val uid: S
    * and put it in an RDD with strong types.
    */
   protected[ml] def extractAFTPoints(dataset: Dataset[_]): RDD[AFTPoint] = {
-    dataset.select(col($(featuresCol)), col($(labelCol)).cast(DoubleType), col($(censorCol)))
-      .rdd.map {
+    dataset.select(col($(featuresCol)), col($(labelCol)).cast(DoubleType),
+      col($(censorCol)).cast(DoubleType)).rdd.map {
         case Row(features: Vector, label: Double, censor: Double) =>
           AFTPoint(features, label, censor)
       }
   }
 
   @Since("2.0.0")
-  override def fit(dataset: Dataset[_]): AFTSurvivalRegressionModel = {
+  override def fit(dataset: Dataset[_]): AFTSurvivalRegressionModel = instrumented { instr =>
     transformSchema(dataset.schema, logging = true)
     val instances = extractAFTPoints(dataset)
-    val handlePersistence = dataset.rdd.getStorageLevel == StorageLevel.NONE
+    val handlePersistence = dataset.storageLevel == StorageLevel.NONE
     if (handlePersistence) instances.persist(StorageLevel.MEMORY_AND_DISK)
 
     val featuresSummarizer = {
@@ -227,9 +230,17 @@ class AFTSurvivalRegression @Since("1.6.0") (@Since("1.6.0") override val uid: S
     val featuresStd = featuresSummarizer.variance.toArray.map(math.sqrt)
     val numFeatures = featuresStd.size
 
+    instr.logPipelineStage(this)
+    instr.logDataset(dataset)
+    instr.logParams(this, labelCol, featuresCol, censorCol, predictionCol, quantilesCol,
+      fitIntercept, maxIter, tol, aggregationDepth)
+    instr.logNamedValue("quantileProbabilities.size", $(quantileProbabilities).length)
+    instr.logNumFeatures(numFeatures)
+    instr.logNumExamples(featuresSummarizer.count)
+
     if (!$(fitIntercept) && (0 until numFeatures).exists { i =>
         featuresStd(i) == 0.0 && featuresSummarizer.mean(i) != 0.0 }) {
-      logWarning("Fitting AFTSurvivalRegressionModel without intercept on dataset with " +
+      instr.logWarning("Fitting AFTSurvivalRegressionModel without intercept on dataset with " +
         "constant nonzero column, Spark MLlib outputs zero coefficients for constant nonzero " +
         "columns. This behavior is different from R survival::survreg.")
     }
@@ -264,7 +275,7 @@ class AFTSurvivalRegression @Since("1.6.0") (@Since("1.6.0") override val uid: S
       state.x.toArray.clone()
     }
 
-    bcFeaturesStd.destroy(blocking = false)
+    bcFeaturesStd.destroy()
     if (handlePersistence) instances.unpersist()
 
     val rawCoefficients = parameters.slice(2, parameters.length)
@@ -276,8 +287,7 @@ class AFTSurvivalRegression @Since("1.6.0") (@Since("1.6.0") override val uid: S
     val coefficients = Vectors.dense(rawCoefficients)
     val intercept = parameters(1)
     val scale = math.exp(parameters(0))
-    val model = new AFTSurvivalRegressionModel(uid, coefficients, intercept, scale)
-    copyValues(model.setParent(this))
+    copyValues(new AFTSurvivalRegressionModel(uid, coefficients, intercept, scale).setParent(this))
   }
 
   @Since("1.6.0")
@@ -345,13 +355,28 @@ class AFTSurvivalRegressionModel private[ml] (
   @Since("2.0.0")
   override def transform(dataset: Dataset[_]): DataFrame = {
     transformSchema(dataset.schema, logging = true)
-    val predictUDF = udf { features: Vector => predict(features) }
-    val predictQuantilesUDF = udf { features: Vector => predictQuantiles(features)}
+
+    var predictionColNames = Seq.empty[String]
+    var predictionColumns = Seq.empty[Column]
+
+    if ($(predictionCol).nonEmpty) {
+      val predictUDF = udf { features: Vector => predict(features) }
+      predictionColNames :+= $(predictionCol)
+      predictionColumns :+= predictUDF(col($(featuresCol)))
+    }
+
     if (hasQuantilesCol) {
-      dataset.withColumn($(predictionCol), predictUDF(col($(featuresCol))))
-        .withColumn($(quantilesCol), predictQuantilesUDF(col($(featuresCol))))
+      val predictQuantilesUDF = udf { features: Vector => predictQuantiles(features)}
+      predictionColNames :+= $(quantilesCol)
+      predictionColumns :+= predictQuantilesUDF(col($(featuresCol)))
+    }
+
+    if (predictionColNames.nonEmpty) {
+      dataset.withColumns(predictionColNames, predictionColumns)
     } else {
-      dataset.withColumn($(predictionCol), predictUDF(col($(featuresCol))))
+      this.logWarning(s"$uid: AFTSurvivalRegressionModel.transform() does nothing" +
+        " because no output columns were set.")
+      dataset.toDF()
     }
   }
 
@@ -413,7 +438,7 @@ object AFTSurvivalRegressionModel extends MLReadable[AFTSurvivalRegressionModel]
           .head()
       val model = new AFTSurvivalRegressionModel(metadata.uid, coefficients, intercept, scale)
 
-      DefaultParamsReader.getAndSetParams(model, metadata)
+      metadata.getAndSetParams(model)
       model
     }
   }
@@ -518,7 +543,7 @@ private class AFTAggregator(
   private var totalCnt: Long = 0L
   private var lossSum = 0.0
   // Here we optimize loss function over log(sigma), intercept and coefficients
-  private val gradientSumArray = Array.ofDim[Double](length)
+  private lazy val gradientSumArray = Array.ofDim[Double](length)
 
   def count: Long = totalCnt
   def loss: Double = {
@@ -544,6 +569,8 @@ private class AFTAggregator(
     val xi = data.features
     val ti = data.label
     val delta = data.censor
+
+    require(ti > 0.0, "The lifetime or label should be  greater than 0.")
 
     val localFeaturesStd = bcFeaturesStd.value
 
@@ -621,7 +648,7 @@ private class AFTCostFun(
         case (aggregator1, aggregator2) => aggregator1.merge(aggregator2)
       }, depth = aggregationDepth)
 
-    bcParameters.destroy(blocking = false)
+    bcParameters.destroy()
     (aftAggregator.loss, aftAggregator.gradient)
   }
 }

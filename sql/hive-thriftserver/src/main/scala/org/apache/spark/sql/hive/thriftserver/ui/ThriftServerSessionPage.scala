@@ -55,9 +55,9 @@ private[ui] class ThriftServerSessionPage(parent: ThriftServerTab)
         Session created at {formatDate(sessionStat.startTimestamp)},
         Total run {sessionStat.totalExecution} SQL
         </h4> ++
-        generateSQLStatsTable(sessionStat.sessionId)
+        generateSQLStatsTable(request, sessionStat.sessionId)
       }
-    UIUtils.headerSparkPage("JDBC/ODBC Session", content, parent, Some(5000))
+    UIUtils.headerSparkPage(request, "JDBC/ODBC Session", content, parent)
   }
 
   /** Generate basic stats of the thrift server program */
@@ -65,7 +65,7 @@ private[ui] class ThriftServerSessionPage(parent: ThriftServerTab)
     val timeSinceStart = System.currentTimeMillis() - startTime.getTime
     <ul class ="unstyled">
       <li>
-        <strong>Started at: </strong> {startTime.toString}
+        <strong>Started at: </strong> {formatDate(startTime)}
       </li>
       <li>
         <strong>Time since start: </strong>{formatDurationVerbose(timeSinceStart)}
@@ -74,18 +74,19 @@ private[ui] class ThriftServerSessionPage(parent: ThriftServerTab)
   }
 
   /** Generate stats of batch statements of the thrift server program */
-  private def generateSQLStatsTable(sessionID: String): Seq[Node] = {
+  private def generateSQLStatsTable(request: HttpServletRequest, sessionID: String): Seq[Node] = {
     val executionList = listener.getExecutionList
       .filter(_.sessionId == sessionID)
     val numStatement = executionList.size
     val table = if (numStatement > 0) {
-      val headerRow = Seq("User", "JobID", "GroupID", "Start Time", "Finish Time", "Duration",
-        "Statement", "State", "Detail")
+      val headerRow = Seq("User", "JobID", "GroupID", "Start Time", "Finish Time", "Close Time",
+        "Execution Time", "Duration", "Statement", "State", "Detail")
       val dataRows = executionList.sortBy(_.startTimestamp).reverse
 
       def generateDataRow(info: ExecutionInfo): Seq[Node] = {
         val jobLink = info.jobId.map { id: String =>
-          <a href={"%s/jobs/job?id=%s".format(UIUtils.prependBaseUri(parent.basePath), id)}>
+          <a href={"%s/jobs/job/?id=%s".format(
+              UIUtils.prependBaseUri(request, parent.basePath), id)}>
             [{id}]
           </a>
         }
@@ -98,7 +99,9 @@ private[ui] class ThriftServerSessionPage(parent: ThriftServerTab)
           <td>{info.groupId}</td>
           <td>{formatDate(info.startTimestamp)}</td>
           <td>{formatDate(info.finishTimestamp)}</td>
-          <td>{formatDurationOption(Some(info.totalTime))}</td>
+          <td>{formatDate(info.closeTimestamp)}</td>
+          <td>{formatDurationOption(Some(info.totalTime(info.finishTimestamp)))}</td>
+          <td>{formatDurationOption(Some(info.totalTime(info.closeTimestamp)))}</td>
           <td>{info.statement}</td>
           <td>{info.state}</td>
           {errorMessageCell(detail)}
@@ -146,42 +149,6 @@ private[ui] class ThriftServerSessionPage(parent: ThriftServerTab)
     <td>{errorSummary}{details}</td>
   }
 
-  /** Generate stats of batch sessions of the thrift server program */
-  private def generateSessionStatsTable(): Seq[Node] = {
-    val sessionList = listener.getSessionList
-    val numBatches = sessionList.size
-    val table = if (numBatches > 0) {
-      val dataRows =
-        sessionList.sortBy(_.startTimestamp).reverse.map ( session =>
-        Seq(
-          session.userName,
-          session.ip,
-          session.sessionId,
-          formatDate(session.startTimestamp),
-          formatDate(session.finishTimestamp),
-          formatDurationOption(Some(session.totalTime)),
-          session.totalExecution.toString
-        )
-      ).toSeq
-      val headerRow = Seq("User", "IP", "Session ID", "Start Time", "Finish Time", "Duration",
-        "Total Execute")
-      Some(listingTable(headerRow, dataRows))
-    } else {
-      None
-    }
-
-    val content =
-      <h5>Session Statistics</h5> ++
-      <div>
-        <ul class="unstyled">
-          {table.getOrElse("No statistics have been generated yet.")}
-        </ul>
-      </div>
-
-    content
-  }
-
-
   /**
    * Returns a human-readable string representing a duration such as "5 second 35 ms"
    */
@@ -197,4 +164,3 @@ private[ui] class ThriftServerSessionPage(parent: ThriftServerTab)
     UIUtils.listingTable(headers, generateDataRow, data, fixedWidth = true)
   }
 }
-

@@ -121,12 +121,12 @@ sealed abstract class Attribute extends Serializable {
 private[attribute] trait AttributeFactory {
 
   /**
-   * Creates an [[Attribute]] from a [[Metadata]] instance.
+   * Creates an [[Attribute]] from a `Metadata` instance.
    */
   private[attribute] def fromMetadata(metadata: Metadata): Attribute
 
   /**
-   * Creates an [[Attribute]] from a [[StructField]] instance, optionally preserving name.
+   * Creates an [[Attribute]] from a `StructField` instance, optionally preserving name.
    */
   private[ml] def decodeStructField(field: StructField, preserveName: Boolean): Attribute = {
     require(field.dataType.isInstanceOf[NumericType])
@@ -145,7 +145,7 @@ private[attribute] trait AttributeFactory {
   }
 
   /**
-   * Creates an [[Attribute]] from a [[StructField]] instance.
+   * Creates an [[Attribute]] from a `StructField` instance.
    */
   def fromStructField(field: StructField): Attribute = decodeStructField(field, false)
 }

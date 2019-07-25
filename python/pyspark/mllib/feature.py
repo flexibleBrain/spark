@@ -22,8 +22,6 @@ from __future__ import absolute_import
 
 import sys
 import warnings
-import random
-import binascii
 if sys.version >= '3':
     basestring = str
     unicode = str
@@ -59,7 +57,7 @@ class VectorTransformer(object):
 
 
 class Normalizer(VectorTransformer):
-    """
+    r"""
     Normalizes samples individually to unit L\ :sup:`p`\  norm
 
     For any 1 <= `p` < float('inf'), normalizes samples using
@@ -282,15 +280,15 @@ class ChiSqSelector(object):
      * `percentile` is similar but chooses a fraction of all features
        instead of a fixed number.
 
-     * `fpr` chooses all features whose p-value is below a threshold,
+     * `fpr` chooses all features whose p-values are below a threshold,
        thus controlling the false positive rate of selection.
 
      * `fdr` uses the `Benjamini-Hochberg procedure <https://en.wikipedia.org/wiki/
        False_discovery_rate#Benjamini.E2.80.93Hochberg_procedure>`_
        to choose all features whose false discovery rate is below a threshold.
 
-     * `fwe` chooses all features whose p-values is below a threshold,
-       thus controlling the family-wise error rate of selection.
+     * `fwe` chooses all features whose p-values are below a threshold. The threshold is scaled by
+       1/numFeatures, thus controlling the family-wise error rate of selection.
 
     By default, the selection method is `numTopFeatures`, with the default number of top features
     set to 50.
@@ -519,6 +517,20 @@ class IDFModel(JavaVectorTransformer):
         Returns the current IDF vector.
         """
         return self.call('idf')
+
+    @since('3.0.0')
+    def docFreq(self):
+        """
+        Returns the document frequency.
+        """
+        return self.call('docFreq')
+
+    @since('3.0.0')
+    def numDocs(self):
+        """
+        Returns number of documents evaluated to compute idf
+        """
+        return self.call('numDocs')
 
 
 class IDF(object):
@@ -819,7 +831,7 @@ def _test():
     (failure_count, test_count) = doctest.testmod(globs=globs, optionflags=doctest.ELLIPSIS)
     spark.stop()
     if failure_count:
-        exit(-1)
+        sys.exit(-1)
 
 if __name__ == "__main__":
     sys.path.pop(0)

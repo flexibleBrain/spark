@@ -17,12 +17,15 @@
 
 package org.apache.spark.scheduler
 
+import java.io.{ByteArrayOutputStream, DataOutputStream, UTFDataFormatException}
 import java.nio.ByteBuffer
 import java.util.Properties
 
 import scala.collection.mutable.HashMap
 
 import org.apache.spark.SparkFunSuite
+import org.apache.spark.resource.ResourceInformation
+import org.apache.spark.resource.ResourceUtils.GPU
 
 class TaskDescriptionSuite extends SparkFunSuite {
   test("encoding and then decoding a TaskDescription results in the same TaskDescription") {
@@ -36,6 +39,24 @@ class TaskDescriptionSuite extends SparkFunSuite {
     val originalProperties = new Properties()
     originalProperties.put("property1", "18")
     originalProperties.put("property2", "test value")
+    // SPARK-19796 -- large property values (like a large job description for a long sql query)
+    // can cause problems for DataOutputStream, make sure we handle correctly
+    val sb = new StringBuilder()
+    (0 to 10000).foreach(_ => sb.append("1234567890"))
+    val largeString = sb.toString()
+    originalProperties.put("property3", largeString)
+    // make sure we've got a good test case
+    intercept[UTFDataFormatException] {
+      val out = new DataOutputStream(new ByteArrayOutputStream())
+      try {
+        out.writeUTF(largeString)
+      } finally {
+        out.close()
+      }
+    }
+
+    val originalResources =
+      Map(GPU -> new ResourceInformation(GPU, Array("1", "2", "3")))
 
     // Create a dummy byte buffer for the task.
     val taskBuffer = ByteBuffer.wrap(Array[Byte](1, 2, 3, 4))
@@ -46,9 +67,11 @@ class TaskDescriptionSuite extends SparkFunSuite {
       executorId = "testExecutor",
       name = "task for test",
       index = 19,
+      partitionId = 1,
       originalFiles,
       originalJars,
       originalProperties,
+      originalResources,
       taskBuffer
     )
 
@@ -61,9 +84,21 @@ class TaskDescriptionSuite extends SparkFunSuite {
     assert(decodedTaskDescription.executorId === originalTaskDescription.executorId)
     assert(decodedTaskDescription.name === originalTaskDescription.name)
     assert(decodedTaskDescription.index === originalTaskDescription.index)
+    assert(decodedTaskDescription.partitionId === originalTaskDescription.partitionId)
     assert(decodedTaskDescription.addedFiles.equals(originalFiles))
     assert(decodedTaskDescription.addedJars.equals(originalJars))
     assert(decodedTaskDescription.properties.equals(originalTaskDescription.properties))
+    assert(equalResources(decodedTaskDescription.resources, originalTaskDescription.resources))
     assert(decodedTaskDescription.serializedTask.equals(taskBuffer))
+
+    def equalResources(original: Map[String, ResourceInformation],
+        target: Map[String, ResourceInformation]): Boolean = {
+      original.size == target.size && original.forall { case (name, info) =>
+        target.get(name).exists { targetInfo =>
+          info.name.equals(targetInfo.name) &&
+            info.addresses.sameElements(targetInfo.addresses)
+        }
+      }
+    }
   }
 }
